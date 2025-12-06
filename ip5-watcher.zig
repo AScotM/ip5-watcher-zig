@@ -2,9 +2,7 @@ const std = @import("std");
 const mem = std.mem;
 const fmt = std.fmt;
 const fs = std.fs;
-const time = std.time;
-const Thread = std.Thread;
-const sort = std.sort;
+const math = std.math;
 
 const PROC_NET_DEV = "/proc/net/dev";
 const SYSFS_NET_PATH = "/sys/class/net";
@@ -74,11 +72,10 @@ const RateCalculator = struct {
     fn calculateRate(current: u64, previous: u64, interval: f64) f64 {
         if (interval <= 0) return 0.0;
 
+        const max_count = @as(u64, @bitCast(@as(i64, -1)));
         if (current >= previous) {
             return @as(f64, @floatFromInt(current - previous)) / interval;
         } else {
-            // Handle counter wrap-around
-            const max_count = (@as(u64, 1) << 32) - 1;
             return @as(f64, @floatFromInt((max_count - previous) + current + 1)) / interval;
         }
     }
@@ -98,9 +95,9 @@ const NetworkMonitor = struct {
     }
 
     fn deinit(self: *NetworkMonitor) void {
-        var it = self.prev_traffic.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
+        var it = self.prev_traffic.keyIterator();
+        while (it.next()) |key| {
+            self.allocator.free(key.*);
         }
         self.prev_traffic.deinit();
     }
@@ -115,32 +112,16 @@ const NetworkMonitor = struct {
         return true;
     }
 
-    fn getInterfaceState(_: *NetworkMonitor, interface: []const u8) []const u8 {
-        // Simple state detection - assume most interfaces are up for basic functionality
-        // You can enhance this later with proper sysfs reading
-        if (mem.eql(u8, interface, "lo")) return "up"; // loopback is always up
-        return "up"; // Assume up for now to avoid sysfs issues
-    }
-
-    fn getAvailableInterfaces(self: *NetworkMonitor) !std.ArrayList([]const u8) {
-        var interfaces = std.ArrayList([]const u8).init(self.allocator);
-        errdefer interfaces.deinit();
-
-        var dir = fs.openDirAbsolute(SYSFS_NET_PATH, .{ .iterate = true }) catch return interfaces;
-        defer dir.close();
-
-        var it = dir.iterate();
-        while (it.next() catch null) |entry| {
-            if (entry.kind != .directory) continue;
-            if (!NetworkMonitor.safeInterfaceName(entry.name)) continue;
-
-            if (!self.config.show_loopback and mem.eql(u8, entry.name, "lo")) continue;
-
-            const iface = try self.allocator.dupe(u8, entry.name);
-            try interfaces.append(iface);
-        }
-
-        return interfaces;
+    fn getInterfaceState(interface: []const u8) []const u8 {
+        var path_buf: [256]u8 = undefined;
+        const path = fmt.bufPrint(&path_buf, "/sys/class/net/{s}/operstate", .{interface}) catch return "unknown";
+        
+        const file = fs.openFileAbsolute(path, .{}) catch return "unknown";
+        defer file.close();
+        
+        var buf: [16]u8 = undefined;
+        const bytes = file.read(&buf) catch return "unknown";
+        return mem.trim(u8, buf[0..bytes], " \n");
     }
 
     fn getDivisor(self: *NetworkMonitor) u64 {
@@ -153,13 +134,13 @@ const NetworkMonitor = struct {
         return if (mem.eql(u8, self.config.units, "decimal")) decimal_units else binary_units;
     }
 
-    fn formatBytes(self: *NetworkMonitor, size: u64) ![]const u8 {
-        if (size == 0) return self.allocator.dupe(u8, "0B");
+    fn formatBytes(self: *NetworkMonitor, arena: std.mem.Allocator, size: u64) ![]const u8 {
+        if (size == 0) return arena.dupe(u8, "0B");
 
         const divisor = self.getDivisor();
         const units = self.getUnits();
         var unit_idx: usize = 0;
-        var readable: f64 = @floatFromInt(size);
+        var readable: f64 = @as(f64, @floatFromInt(size));
 
         while (readable >= @as(f64, @floatFromInt(divisor)) and unit_idx < units.len - 1) {
             readable /= @as(f64, @floatFromInt(divisor));
@@ -174,11 +155,11 @@ const NetworkMonitor = struct {
         else
             try fmt.bufPrint(&buf, "{d:.0}{s}", .{ readable, units[unit_idx] });
             
-        return self.allocator.dupe(u8, result);
+        return arena.dupe(u8, result);
     }
 
-    fn formatRatePrecise(self: *NetworkMonitor, bytes_per_sec: f64) ![]const u8 {
-        if (bytes_per_sec <= 0) return self.allocator.dupe(u8, "0B/s");
+    fn formatRatePrecise(self: *NetworkMonitor, arena: std.mem.Allocator, bytes_per_sec: f64) ![]const u8 {
+        if (bytes_per_sec <= 0) return arena.dupe(u8, "0B/s");
 
         const divisor = self.getDivisor();
         const units = self.getUnits();
@@ -198,15 +179,15 @@ const NetworkMonitor = struct {
         else
             try fmt.bufPrint(&buf, "{d:.0}{s}/s", .{ readable, units[unit_idx] });
             
-        return self.allocator.dupe(u8, result);
+        return arena.dupe(u8, result);
     }
 
-    fn parseProcNetDev(self: *NetworkMonitor) !std.StringHashMap(InterfaceTraffic) {
-        var stats = std.StringHashMap(InterfaceTraffic).init(self.allocator);
+    fn parseProcNetDev(self: *NetworkMonitor, arena: std.mem.Allocator) !std.StringHashMap(InterfaceTraffic) {
+        var stats = std.StringHashMap(InterfaceTraffic).init(arena);
         errdefer {
-            var it = stats.iterator();
-            while (it.next()) |entry| {
-                self.allocator.free(entry.key_ptr.*);
+            var it = stats.keyIterator();
+            while (it.next()) |key| {
+                arena.free(key.*);
             }
             stats.deinit();
         }
@@ -214,11 +195,14 @@ const NetworkMonitor = struct {
         const file = fs.openFileAbsolute(PROC_NET_DEV, .{}) catch return stats;
         defer file.close();
 
-        var reader = file.reader();
-        var line_buf: [1024]u8 = undefined;
+        var content: [8192]u8 = undefined;
+        const bytes_read = try file.readAll(&content);
+        const content_slice = content[0..bytes_read];
+        
         var line_num: usize = 0;
-
-        while (try reader.readUntilDelimiterOrEof(&line_buf, '\n')) |line| {
+        var line_iter = mem.tokenizeScalar(u8, content_slice, '\n');
+        
+        while (line_iter.next()) |line| {
             line_num += 1;
             if (line_num <= 2) continue;
 
@@ -249,10 +233,8 @@ const NetworkMonitor = struct {
             }
 
             if (field_num >= 13) {
-                // Get state using simple detection
-                traffic.state = self.getInterfaceState(iface);
-
-                const iface_copy = try self.allocator.dupe(u8, iface);
+                traffic.state = NetworkMonitor.getInterfaceState(iface);
+                const iface_copy = try arena.dupe(u8, iface);
                 try stats.put(iface_copy, traffic);
             }
 
@@ -264,8 +246,7 @@ const NetworkMonitor = struct {
 };
 
 fn clearScreen() void {
-    const stdout = std.io.getStdOut().writer();
-    stdout.writeAll("\x1b[H\x1b[J") catch {};
+    std.debug.print("\x1b[H\x1b[J", .{});
 }
 
 const InterfaceEntry = struct {
@@ -281,9 +262,9 @@ fn watchMode(monitor: *NetworkMonitor, interval: f64) !void {
 
     var prev_stats = std.StringHashMap(InterfaceTraffic).init(monitor.allocator);
     defer {
-        var it = prev_stats.iterator();
-        while (it.next()) |entry| {
-            monitor.allocator.free(entry.key_ptr.*);
+        var it = prev_stats.keyIterator();
+        while (it.next()) |key| {
+            monitor.allocator.free(key.*);
         }
         prev_stats.deinit();
     }
@@ -301,94 +282,66 @@ fn watchMode(monitor: *NetworkMonitor, interval: f64) !void {
             Colors.GREY, interval, elapsed_total, update_count, Colors.RESET,
         });
 
-        var curr_stats = monitor.parseProcNetDev() catch |err| {
+        var arena = std.heap.ArenaAllocator.init(monitor.allocator);
+        defer arena.deinit();
+        const temp_allocator = arena.allocator();
+
+        var curr_stats = monitor.parseProcNetDev(temp_allocator) catch |err| {
             std.debug.print("{s}Error reading network stats: {s}{s}\n", .{ Colors.RED, @errorName(err), Colors.RESET });
-            // Sleep and continue instead of exiting
             const sleep_duration = @as(u64, @intFromFloat(interval * 1_000_000_000));
-            std.time.sleep(sleep_duration);
+            std.Thread.sleep(sleep_duration);
             continue;
         };
-        defer {
-            var it = curr_stats.iterator();
-            while (it.next()) |entry| {
-                monitor.allocator.free(entry.key_ptr.*);
-            }
-            curr_stats.deinit();
-        }
 
-        var iface_list = std.ArrayList(InterfaceEntry).init(monitor.allocator);
-        defer iface_list.deinit();
-
+        var iface_list = std.ArrayList(InterfaceEntry){};
+        try iface_list.ensureTotalCapacity(temp_allocator, 20);
+        
         var it = curr_stats.iterator();
         while (it.next()) |entry| {
             const iface = entry.key_ptr.*;
             const now = entry.value_ptr.*;
-            try iface_list.append(.{ .name = iface, .traffic = now });
+            try iface_list.append(temp_allocator, .{ .name = iface, .traffic = now });
         }
 
-        // Sort by total bytes
-        sort.block(InterfaceEntry, iface_list.items, {}, struct {
+        const items = iface_list.items;
+        std.sort.block(InterfaceEntry, items, {}, struct {
             fn lessThan(_: void, a: InterfaceEntry, b: InterfaceEntry) bool {
                 return a.traffic.totalBytes() > b.traffic.totalBytes();
             }
         }.lessThan);
 
-        for (iface_list.items) |item| {
+        var line_buf: [256]u8 = undefined;
+        for (items) |item| {
             const iface = item.name;
             const now = item.traffic;
             const state_color = if (now.isUp()) Colors.GREEN else Colors.RED;
 
-            var line_parts = std.ArrayList([]const u8).init(monitor.allocator);
-            defer {
-                for (line_parts.items) |part| {
-                    monitor.allocator.free(part);
-                }
-                line_parts.deinit();
-            }
+            var stream = std.io.fixedBufferStream(&line_buf);
+            var writer = stream.writer();
 
-            try line_parts.append(try fmt.allocPrint(monitor.allocator, "{s}{s:<12}{s} [{s}{s:<5}{s}]", .{
+            try writer.print("{s}{s:<12}{s} [{s}{s:<5}{s}]", .{
                 Colors.SEPIA, iface, Colors.RESET, state_color, now.state, Colors.RESET,
-            }));
+            });
 
             if (prev_stats.get(iface)) |prev| {
                 const rx_rate = RateCalculator.calculateRate(now.rx_bytes, prev.rx_bytes, interval);
                 const tx_rate = RateCalculator.calculateRate(now.tx_bytes, prev.tx_bytes, interval);
 
-                const rx_str = try monitor.formatRatePrecise(rx_rate);
-                defer monitor.allocator.free(rx_str);
-                const tx_str = try monitor.formatRatePrecise(tx_rate);
-                defer monitor.allocator.free(tx_str);
+                const rx_str = try monitor.formatRatePrecise(temp_allocator, rx_rate);
+                const tx_str = try monitor.formatRatePrecise(temp_allocator, tx_rate);
 
-                try line_parts.append(try fmt.allocPrint(monitor.allocator, "RX: {s}{s:<12}{s}", .{
-                    Colors.GREEN, rx_str, Colors.RESET,
-                }));
-
-                try line_parts.append(try fmt.allocPrint(monitor.allocator, "TX: {s}{s:<12}{s}", .{
-                    Colors.YELLOW, tx_str, Colors.RESET,
-                }));
+                try writer.print(" RX: {s}{s:<12}{s}", .{ Colors.GREEN, rx_str, Colors.RESET });
+                try writer.print(" TX: {s}{s:<12}{s}", .{ Colors.YELLOW, tx_str, Colors.RESET });
             } else {
-                // First reading - show cumulative stats instead of rates
-                const rx_str = try monitor.formatBytes(now.rx_bytes);
-                defer monitor.allocator.free(rx_str);
-                const tx_str = try monitor.formatBytes(now.tx_bytes);
-                defer monitor.allocator.free(tx_str);
+                const rx_str = try monitor.formatBytes(temp_allocator, now.rx_bytes);
+                const tx_str = try monitor.formatBytes(temp_allocator, now.tx_bytes);
 
-                try line_parts.append(try fmt.allocPrint(monitor.allocator, "RX: {s}{s:<12}{s}", .{
-                    Colors.GREEN, rx_str, Colors.RESET,
-                }));
-
-                try line_parts.append(try fmt.allocPrint(monitor.allocator, "TX: {s}{s:<12}{s}", .{
-                    Colors.YELLOW, tx_str, Colors.RESET,
-                }));
-
-                try line_parts.append(try fmt.allocPrint(monitor.allocator, "{s}(cumulative){s}", .{
-                    Colors.GREY, Colors.RESET,
-                }));
+                try writer.print(" RX: {s}{s:<12}{s}", .{ Colors.GREEN, rx_str, Colors.RESET });
+                try writer.print(" TX: {s}{s:<12}{s}", .{ Colors.YELLOW, tx_str, Colors.RESET });
+                try writer.print(" {s}(cumulative){s}", .{ Colors.GREY, Colors.RESET });
             }
 
-            const line = try mem.join(monitor.allocator, " ", line_parts.items);
-            defer monitor.allocator.free(line);
-            std.debug.print("{s}\n", .{line});
+            std.debug.print("{s}\n", .{line_buf[0..stream.pos]});
         }
 
         if (curr_stats.count() == 0) {
@@ -407,20 +360,24 @@ fn watchMode(monitor: *NetworkMonitor, interval: f64) !void {
             total_tx += traffic.tx_bytes;
         }
 
-        const total_rx_str = try monitor.formatBytes(total_rx);
-        defer monitor.allocator.free(total_rx_str);
-        const total_tx_str = try monitor.formatBytes(total_tx);
-        defer monitor.allocator.free(total_tx_str);
+        const total_rx_str = try monitor.formatBytes(temp_allocator, total_rx);
+        const total_tx_str = try monitor.formatBytes(temp_allocator, total_tx);
 
-        std.debug.print("\n{s}[Ctrl+C to stop] | Interfaces: {d} (active: {d}) | Total: RX {s} / TX {s}{s}\n", .{
+        const now_timestamp = std.time.timestamp();
+        const hours = @mod(@divTrunc(now_timestamp, 3600), 24);
+        const minutes = @mod(@divTrunc(now_timestamp, 60), 60);
+        const seconds = @mod(now_timestamp, 60);
+        var time_buf: [9]u8 = undefined;
+        const time_str = try fmt.bufPrint(&time_buf, "{d:0>2}:{d:0>2}:{d:0>2}", .{ hours, minutes, seconds });
+
+        std.debug.print("\n{s}[Ctrl+C to stop] | Interfaces: {d} (active: {d}) | Total: RX {s} / TX {s} | Time: {s}{s}\n", .{
             Colors.GREY, curr_stats.count(), active_count,
-            total_rx_str, total_tx_str, Colors.RESET,
+            total_rx_str, total_tx_str, time_str, Colors.RESET,
         });
 
-        // Update previous stats for next iteration
-        var prev_it = prev_stats.iterator();
-        while (prev_it.next()) |entry| {
-            monitor.allocator.free(entry.key_ptr.*);
+        var prev_it = prev_stats.keyIterator();
+        while (prev_it.next()) |key| {
+            monitor.allocator.free(key.*);
         }
         prev_stats.clearAndFree();
 
@@ -433,7 +390,7 @@ fn watchMode(monitor: *NetworkMonitor, interval: f64) !void {
         update_count += 1;
 
         const sleep_duration = @as(u64, @intFromFloat(interval * 1_000_000_000));
-        std.time.sleep(sleep_duration);
+        std.Thread.sleep(sleep_duration);
     }
 }
 
