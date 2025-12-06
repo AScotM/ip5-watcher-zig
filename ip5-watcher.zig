@@ -3,6 +3,7 @@ const mem = std.mem;
 const fmt = std.fmt;
 const fs = std.fs;
 const math = std.math;
+const time = std.time;
 
 const PROC_NET_DEV = "/proc/net/dev";
 const SYSFS_NET_PATH = "/sys/class/net";
@@ -95,9 +96,9 @@ const NetworkMonitor = struct {
     }
 
     fn deinit(self: *NetworkMonitor) void {
-        var it = self.prev_traffic.keyIterator();
-        while (it.next()) |key| {
-            self.allocator.free(key.*);
+        var it = self.prev_traffic.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
         }
         self.prev_traffic.deinit();
     }
@@ -184,13 +185,6 @@ const NetworkMonitor = struct {
 
     fn parseProcNetDev(self: *NetworkMonitor, arena: std.mem.Allocator) !std.StringHashMap(InterfaceTraffic) {
         var stats = std.StringHashMap(InterfaceTraffic).init(arena);
-        errdefer {
-            var it = stats.keyIterator();
-            while (it.next()) |key| {
-                arena.free(key.*);
-            }
-            stats.deinit();
-        }
 
         const file = fs.openFileAbsolute(PROC_NET_DEV, .{}) catch return stats;
         defer file.close();
@@ -262,19 +256,19 @@ fn watchMode(monitor: *NetworkMonitor, interval: f64) !void {
 
     var prev_stats = std.StringHashMap(InterfaceTraffic).init(monitor.allocator);
     defer {
-        var it = prev_stats.keyIterator();
-        while (it.next()) |key| {
-            monitor.allocator.free(key.*);
+        var it = prev_stats.iterator();
+        while (it.next()) |entry| {
+            monitor.allocator.free(entry.key_ptr.*);
         }
         prev_stats.deinit();
     }
 
-    const start_time = std.time.timestamp();
+    const start_time = time.timestamp();
     var update_count: usize = 0;
 
     while (true) {
         clearScreen();
-        const current_time = std.time.timestamp();
+        const current_time = time.timestamp();
         const elapsed_total = @as(f64, @floatFromInt(current_time - start_time));
 
         std.debug.print("{s}Live Network Traffic Monitor{s}\n", .{ Colors.BLUE, Colors.RESET });
@@ -293,25 +287,27 @@ fn watchMode(monitor: *NetworkMonitor, interval: f64) !void {
             continue;
         };
 
-        var iface_list = std.ArrayList(InterfaceEntry){};
-        try iface_list.ensureTotalCapacity(temp_allocator, 20);
+        const iface_count = curr_stats.count();
+        var iface_entries = try temp_allocator.alloc(InterfaceEntry, iface_count);
+        var idx: usize = 0;
         
         var it = curr_stats.iterator();
         while (it.next()) |entry| {
             const iface = entry.key_ptr.*;
             const now = entry.value_ptr.*;
-            try iface_list.append(temp_allocator, .{ .name = iface, .traffic = now });
+            iface_entries[idx] = .{ .name = iface, .traffic = now };
+            idx += 1;
         }
 
-        const items = iface_list.items;
-        std.sort.block(InterfaceEntry, items, {}, struct {
-            fn lessThan(_: void, a: InterfaceEntry, b: InterfaceEntry) bool {
+        std.sort.block(InterfaceEntry, iface_entries, {}, struct {
+            fn lessThan(context: void, a: InterfaceEntry, b: InterfaceEntry) bool {
+                _ = context;
                 return a.traffic.totalBytes() > b.traffic.totalBytes();
             }
         }.lessThan);
 
         var line_buf: [256]u8 = undefined;
-        for (items) |item| {
+        for (iface_entries) |item| {
             const iface = item.name;
             const now = item.traffic;
             const state_color = if (now.isUp()) Colors.GREEN else Colors.RED;
@@ -341,7 +337,7 @@ fn watchMode(monitor: *NetworkMonitor, interval: f64) !void {
                 try writer.print(" {s}(cumulative){s}", .{ Colors.GREY, Colors.RESET });
             }
 
-            std.debug.print("{s}\n", .{line_buf[0..stream.pos]});
+            std.debug.print("{s}\n", .{stream.getWritten()});
         }
 
         if (curr_stats.count() == 0) {
@@ -363,7 +359,7 @@ fn watchMode(monitor: *NetworkMonitor, interval: f64) !void {
         const total_rx_str = try monitor.formatBytes(temp_allocator, total_rx);
         const total_tx_str = try monitor.formatBytes(temp_allocator, total_tx);
 
-        const now_timestamp = std.time.timestamp();
+        const now_timestamp = time.timestamp();
         const hours = @mod(@divTrunc(now_timestamp, 3600), 24);
         const minutes = @mod(@divTrunc(now_timestamp, 60), 60);
         const seconds = @mod(now_timestamp, 60);
@@ -375,16 +371,20 @@ fn watchMode(monitor: *NetworkMonitor, interval: f64) !void {
             total_rx_str, total_tx_str, time_str, Colors.RESET,
         });
 
-        var prev_it = prev_stats.keyIterator();
-        while (prev_it.next()) |key| {
-            monitor.allocator.free(key.*);
+        {
+            var prev_it = prev_stats.iterator();
+            while (prev_it.next()) |entry| {
+                monitor.allocator.free(entry.key_ptr.*);
+            }
+            prev_stats.clearRetainingCapacity();
         }
-        prev_stats.clearAndFree();
 
-        var curr_it = curr_stats.iterator();
-        while (curr_it.next()) |entry| {
-            const iface_copy = try monitor.allocator.dupe(u8, entry.key_ptr.*);
-            try prev_stats.put(iface_copy, entry.value_ptr.*);
+        {
+            var curr_it = curr_stats.iterator();
+            while (curr_it.next()) |entry| {
+                const iface_copy = try monitor.allocator.dupe(u8, entry.key_ptr.*);
+                try prev_stats.put(iface_copy, entry.value_ptr.*);
+            }
         }
 
         update_count += 1;
